@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     cpu        REAL NOT NULL,
     memory_mb  INTEGER NOT NULL,
     replicas   INTEGER NOT NULL,
-    result     TEXT
+    result     TEXT,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    attempt      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS leases (
     job_id        TEXT PRIMARY KEY,
@@ -38,16 +40,27 @@ class Store:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema (idempotent)."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+        if "max_attempts" not in cols:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3")
+        if "attempt" not in cols:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
 
     # -- jobs -------------------------------------------------------------
     def save_job(self, job: Job) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?)",
                 (job.job_id, job.group_id, job.state.value,
                  job.per_replica.cpu, job.per_replica.memory_mb,
-                 job.replicas, job.result),
+                 job.replicas, job.result, job.max_attempts, job.attempt),
             )
             if job.lease is not None:
                 self._conn.execute(
@@ -73,7 +86,8 @@ class Store:
             return [self._row_to_job(r) for r in rows]
 
     def _row_to_job(self, row: tuple) -> Job:
-        job_id, group_id, state, cpu, memory_mb, replicas, result = row
+        (job_id, group_id, state, cpu, memory_mb, replicas, result,
+         max_attempts, attempt) = row
         lease_row = self._conn.execute(
             "SELECT worker_id, fencing_token, expires_at FROM leases WHERE job_id=?",
             (job_id,)).fetchone()
@@ -83,7 +97,8 @@ class Store:
                           fencing_token=lease_row[1], expires_at=lease_row[2])
         return Job(job_id=job_id, group_id=group_id, state=JobState(state),
                    per_replica=Resources(cpu=cpu, memory_mb=memory_mb),
-                   replicas=replicas, result=result, lease=lease)
+                   replicas=replicas, result=result, lease=lease,
+                   max_attempts=max_attempts, attempt=attempt)
 
     # -- fencing token counter (monotonic across restarts) -----------------
     def next_fencing_token(self) -> int:

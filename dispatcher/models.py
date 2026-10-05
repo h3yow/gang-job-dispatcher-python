@@ -16,6 +16,9 @@ class JobState(str, enum.Enum):
 
 TERMINAL_STATES = {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}
 
+#: Default retry budget when a submission does not specify one.
+DEFAULT_MAX_ATTEMPTS = 3
+
 
 @dataclass(frozen=True)
 class Resources:
@@ -44,6 +47,8 @@ class Job:
     replicas: int
     result: str | None = None
     lease: "Lease | None" = None
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    attempt: int = 0  # how many times this job has been claimed
 
     @property
     def demand(self) -> Resources:

@@ -24,6 +24,9 @@ class RejectReason:
     UNKNOWN_JOB = "UNKNOWN_JOB"
     STALE_FENCING_TOKEN = "STALE_FENCING_TOKEN"
     ILLEGAL_STATE = "ILLEGAL_STATE"
+    # the claim is gone: job ended, re-queued, or re-leased to someone else;
+    # the holder must stop working (distinct from every other rejection)
+    LEASE_LOST = "LEASE_LOST"
 
 
 class Scheduler:
@@ -49,9 +52,19 @@ class Scheduler:
         return f"cpu={r.cpu},mem_mb={r.memory_mb}"
 
     def _used_locked(self) -> Resources:
+        # A gang (shared group_id) holds its whole reservation until *every*
+        # member is terminal, so a retrying gang never has to re-acquire
+        # capacity and a succeeded member cannot oversell by releasing early.
+        open_groups: set[str] = set()
+        for job in self._jobs.values():
+            if job.group_id is not None and job.state not in TERMINAL_STATES:
+                open_groups.add(job.group_id)
         used = Resources(0.0, 0)
         for job in self._jobs.values():
-            if job.state not in TERMINAL_STATES:
+            if job.group_id is not None:
+                if job.group_id in open_groups:
+                    used = used.plus(job.demand)
+            elif job.state not in TERMINAL_STATES:
                 used = used.plus(job.demand)
         return used
 
@@ -75,7 +88,9 @@ class Scheduler:
                     or not isinstance(j.replicas, int)
                     or j.replicas < 1
                     or j.per_replica.cpu <= 0
-                    or j.per_replica.memory_mb <= 0):
+                    or j.per_replica.memory_mb <= 0
+                    or not isinstance(j.max_attempts, int)
+                    or j.max_attempts < 1):
                 log.warning("reject submit: invalid declaration job=%s replicas=%s res=%s",
                             getattr(j, "job_id", None), getattr(j, "replicas", None),
                             getattr(j, "per_replica", None))
@@ -151,13 +166,41 @@ class Scheduler:
                               expires_at=self._clock() + self._lease_seconds)
                 cached.state = JobState.LEASED
                 cached.lease = lease
+                cached.attempt += 1  # every claim is a fresh, distinguishable attempt
                 self._store.save_job(cached)
-                log.info("lease granted job=%s worker=%s token=%d expires_in=%.1fs "
-                         "available={%s} (reserved, unchanged)",
-                         job.job_id, worker_id, token, self._lease_seconds,
+                log.info("lease granted job=%s worker=%s token=%d attempt=%d/%d "
+                         "expires_in=%.1fs available={%s} (reserved, unchanged)",
+                         job.job_id, worker_id, token, cached.attempt,
+                         cached.max_attempts, self._lease_seconds,
                          self._cap_repr(self._available_locked()))
                 return cached, token
             return None, None
+
+    # -- lease renewal: extend expiry, identity & capacity untouched -------
+    def renew(self, job_id: str, fencing_token: int) -> tuple[bool, str | None]:
+        """Extend the current lease's expiry. Only the live lease holder may
+        renew; the fencing token and capacity accounting do not change."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                log.warning("reject renew: unknown job=%s token=%s",
+                            job_id, fencing_token)
+                return False, RejectReason.UNKNOWN_JOB
+            current = job.lease
+            if (job.state != JobState.LEASED or current is None
+                    or current.fencing_token != fencing_token):
+                held = current.fencing_token if current else None
+                log.warning("reject renew: LEASE_LOST job=%s state=%s got_token=%s "
+                            "current_token=%s; holder must stop",
+                            job_id, job.state.value, fencing_token, held)
+                return False, RejectReason.LEASE_LOST
+            current.expires_at = self._clock() + self._lease_seconds
+            self._store.save_job(job)
+            log.info("lease renewed job=%s worker=%s token=%d expires_in=%.1fs "
+                     "(identity & capacity unchanged)",
+                     job_id, current.worker_id, current.fencing_token,
+                     self._lease_seconds)
+            return True, None
 
     # -- result reporting with fencing -----------------------------------
     def report(self, job_id: str, fencing_token: int, success: bool,
@@ -183,16 +226,72 @@ class Scheduler:
                 return False, RejectReason.STALE_FENCING_TOKEN
 
             before = self._available_locked()
-            job.state = JobState.SUCCEEDED if success else JobState.FAILED
-            job.result = result
-            released = job.demand
-            job.lease = None
-            self._store.save_job(job)
-            log.info("job=%s reported %s token=%d released={%s} available: {%s} -> {%s}",
-                     job_id, job.state.value, fencing_token,
-                     self._cap_repr(released), self._cap_repr(before),
+            if success:
+                job.state = JobState.SUCCEEDED
+                job.result = result
+                job.lease = None
+                self._store.save_job(job)
+                log.info("job=%s reported SUCCEEDED token=%d attempt=%d "
+                         "available: {%s} -> {%s}",
+                         job_id, fencing_token, job.attempt,
+                         self._cap_repr(before),
+                         self._cap_repr(self._available_locked()))
+                return True, None
+            return self._fail_locked(job, fencing_token, result, before)
+
+    # -- failure handling: bounded retry, gang-atomic ----------------------
+    def _gang_locked(self, job: Job) -> list[Job]:
+        """All members sharing the job's group (itself if ungrouped)."""
+        if job.group_id is None:
+            return [job]
+        return [j for j in self._jobs.values() if j.group_id == job.group_id]
+
+    def _fail_locked(self, job: Job, fencing_token: int,
+                     result: str | None, before: Resources
+                     ) -> tuple[bool, str | None]:
+        job.result = result
+        gang = self._gang_locked(job)
+        ids = sorted(j.job_id for j in gang)
+        if job.attempt < job.max_attempts:
+            # retry budget left: the *whole gang* becomes claimable again.
+            # Capacity is untouched: a gang's reservation is held until every
+            # member is terminal, so retrying never re-acquires or oversells.
+            for member in gang:
+                if member.state == JobState.CANCELLED:
+                    continue  # explicit cancellation is never resurrected
+                old = member.lease
+                member.state = JobState.READY
+                member.lease = None
+                member.result = None
+                self._store.save_job(member)
+                if old is not None:
+                    log.info("gang retry: lease revoked job=%s worker=%s "
+                             "stale_token=%d", member.job_id,
+                             old.worker_id, old.fencing_token)
+            log.info("job=%s failed token=%d attempt=%d/%d -> gang %s re-queued "
+                     "(all READY); capacity held, available: {%s} -> {%s}",
+                     job.job_id, fencing_token, job.attempt, job.max_attempts,
+                     ids, self._cap_repr(before),
                      self._cap_repr(self._available_locked()))
             return True, None
+        # budget exhausted: the *whole gang* ends together
+        for member in gang:
+            if member.state in TERMINAL_STATES:
+                continue
+            old = member.lease
+            member.state = JobState.FAILED
+            member.lease = None
+            self._store.save_job(member)
+            if old is not None:
+                log.info("gang exhausted: lease revoked job=%s worker=%s "
+                         "stale_token=%d", member.job_id,
+                         old.worker_id, old.fencing_token)
+        log.info("job=%s failed token=%d attempt=%d/%d -> gang %s FAILED "
+                 "(terminal); reservation released, available: {%s} -> {%s}",
+                 job.job_id, fencing_token, job.attempt, job.max_attempts,
+                 ids, self._cap_repr(before),
+                 self._cap_repr(self._available_locked()))
+        return True, None
 
     # -- cancellation (any state, deterministic) --------------------------
     def cancel(self, job_id: str) -> tuple[bool, str | None]:
