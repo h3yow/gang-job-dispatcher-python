@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from .models import Job, JobState, Resources
+from .models import DEFAULT_MAX_ATTEMPTS, Job, JobState, Resources
 from .scheduler import Scheduler
 
 
@@ -14,6 +14,7 @@ class JobSpec(BaseModel):
     cpu: float = Field(gt=0)
     memory_mb: int = Field(gt=0)
     replicas: int = Field(ge=1)
+    max_attempts: int = Field(default=DEFAULT_MAX_ATTEMPTS, ge=1)
 
 
 class SubmitRequest(BaseModel):
@@ -30,6 +31,11 @@ class ReportRequest(BaseModel):
     result: str | None = None
 
 
+class RenewRequest(BaseModel):
+    worker_id: str
+    fencing_token: int
+
+
 def _job_view(job: Job) -> dict:
     return {
         "job_id": job.job_id,
@@ -39,6 +45,8 @@ def _job_view(job: Job) -> dict:
         "memory_mb": job.per_replica.memory_mb,
         "replicas": job.replicas,
         "result": job.result,
+        "attempts": job.attempts,
+        "max_attempts": job.max_attempts,
     }
 
 
@@ -49,7 +57,7 @@ def create_app(scheduler: Scheduler) -> FastAPI:
     def submit(req: SubmitRequest):
         jobs = [Job(job_id=s.job_id, group_id=s.group_id, state=JobState.PENDING,
                     per_replica=Resources(cpu=s.cpu, memory_mb=s.memory_mb),
-                    replicas=s.replicas) for s in req.jobs]
+                    replicas=s.replicas, max_attempts=s.max_attempts) for s in req.jobs]
         ok, reason = scheduler.submit(jobs)
         return {"accepted": ok, "reason": reason}
 
@@ -63,6 +71,11 @@ def create_app(scheduler: Scheduler) -> FastAPI:
     @app.post("/jobs/{job_id}/report")
     def report(job_id: str, req: ReportRequest):
         ok, reason = scheduler.report(job_id, req.fencing_token, req.success, req.result)
+        return {"accepted": ok, "reason": reason}
+
+    @app.post("/jobs/{job_id}/renew")
+    def renew(job_id: str, req: RenewRequest):
+        ok, reason = scheduler.renew(job_id, req.fencing_token, req.worker_id)
         return {"accepted": ok, "reason": reason}
 
     @app.post("/jobs/{job_id}/cancel")

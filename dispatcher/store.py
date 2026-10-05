@@ -8,7 +8,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 
-from .models import Job, JobState, Lease, Resources
+from .models import DEFAULT_MAX_ATTEMPTS, Job, JobState, Lease, Resources
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -18,9 +18,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     cpu        REAL NOT NULL,
     memory_mb  INTEGER NOT NULL,
     replicas   INTEGER NOT NULL,
-    result     TEXT
-);
-CREATE TABLE IF NOT EXISTS leases (
+    result     TEXT,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 0
+);CREATE TABLE IF NOT EXISTS leases (
     job_id        TEXT PRIMARY KEY,
     worker_id     TEXT NOT NULL,
     fencing_token INTEGER NOT NULL,
@@ -38,16 +39,29 @@ class Store:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first schema version."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+        if "attempts" not in cols:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        if "max_attempts" not in cols:
+            # 0 is a sentinel for "pre-retry-feature row": reads map it to
+            # DEFAULT_MAX_ATTEMPTS.
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 0")
 
     # -- jobs -------------------------------------------------------------
     def save_job(self, job: Job) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?)",
                 (job.job_id, job.group_id, job.state.value,
                  job.per_replica.cpu, job.per_replica.memory_mb,
-                 job.replicas, job.result),
+                 job.replicas, job.result, job.attempts, job.max_attempts),
             )
             if job.lease is not None:
                 self._conn.execute(
@@ -73,7 +87,8 @@ class Store:
             return [self._row_to_job(r) for r in rows]
 
     def _row_to_job(self, row: tuple) -> Job:
-        job_id, group_id, state, cpu, memory_mb, replicas, result = row
+        job_id, group_id, state, cpu, memory_mb, replicas, result, \
+            attempts, max_attempts = row
         lease_row = self._conn.execute(
             "SELECT worker_id, fencing_token, expires_at FROM leases WHERE job_id=?",
             (job_id,)).fetchone()
@@ -83,7 +98,9 @@ class Store:
                           fencing_token=lease_row[1], expires_at=lease_row[2])
         return Job(job_id=job_id, group_id=group_id, state=JobState(state),
                    per_replica=Resources(cpu=cpu, memory_mb=memory_mb),
-                   replicas=replicas, result=result, lease=lease)
+                   replicas=replicas, result=result, lease=lease,
+                   attempts=attempts,
+                   max_attempts=max_attempts or DEFAULT_MAX_ATTEMPTS)
 
     # -- fencing token counter (monotonic across restarts) -----------------
     def next_fencing_token(self) -> int:

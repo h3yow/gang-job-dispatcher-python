@@ -16,6 +16,10 @@ class JobState(str, enum.Enum):
 
 TERMINAL_STATES = {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}
 
+#: Default upper bound on execution attempts when the submitter does not
+#: specify one. Attempt N is created by the Nth claim of the job.
+DEFAULT_MAX_ATTEMPTS = 3
+
 
 @dataclass(frozen=True)
 class Resources:
@@ -44,6 +48,8 @@ class Job:
     replicas: int
     result: str | None = None
     lease: "Lease | None" = None
+    attempts: int = 0                      # how many times the job was claimed
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
     @property
     def demand(self) -> Resources:

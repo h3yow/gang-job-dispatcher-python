@@ -62,3 +62,42 @@ def test_cancel_via_api(client):
     r = client.post("/jobs/c1/cancel").json()
     assert r == {"accepted": True, "reason": None}
     assert client.get("/capacity").json()["available"]["cpu"] == 2.0
+
+
+def test_renew_and_retry_via_api(client, clock):
+    r = client.post("/jobs", json={"jobs": [
+        {"job_id": "j1", "cpu": 1.0, "memory_mb": 256, "replicas": 1,
+         "max_attempts": 2}]}).json()
+    assert r == {"accepted": True, "reason": None}
+
+    claimed = client.post("/claim", json={"worker_id": "w1"}).json()
+    tok = claimed["fencing_token"]
+    assert claimed["job"]["max_attempts"] == 2
+    assert claimed["job"]["attempts"] == 1
+
+    # renew with the right identity succeeds
+    r = client.post("/jobs/j1/renew",
+                    json={"worker_id": "w1", "fencing_token": tok}).json()
+    assert r == {"accepted": True, "reason": None}
+    # renew with a foreign identity is rejected as LEASE_LOST
+    r = client.post("/jobs/j1/renew",
+                    json={"worker_id": "w2", "fencing_token": tok}).json()
+    assert r == {"accepted": False, "reason": "LEASE_LOST"}
+
+    # first attempt fails -> job is requeued, not terminal
+    r = client.post("/jobs/j1/report",
+                    json={"fencing_token": tok, "success": False}).json()
+    assert r == {"accepted": True, "reason": None}
+    view = client.get("/jobs").json()["jobs"][0]
+    assert view["state"] == "READY" and view["attempts"] == 1
+
+    # second attempt fails -> cap reached, terminal
+    tok2 = client.post("/claim", json={"worker_id": "w2"}).json()["fencing_token"]
+    client.post("/jobs/j1/report",
+                json={"fencing_token": tok2, "success": False})
+    view = client.get("/jobs").json()["jobs"][0]
+    assert view["state"] == "FAILED"
+    # renew on a terminal job is LEASE_LOST
+    r = client.post("/jobs/j1/renew",
+                    json={"worker_id": "w2", "fencing_token": tok2}).json()
+    assert r == {"accepted": False, "reason": "LEASE_LOST"}
